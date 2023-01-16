@@ -12,7 +12,77 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
-static void conv1x1s1_int8_sse(const Mat &bottom_blob, Mat &top_blob, const Mat &_kernel, const Option& opt)
+static void conv1x1s1_sgemm_int8_sse(const Mat& bottom_blob, Mat& top_blob, const Mat& kernel, const Option& opt)
+{
+    int w = bottom_blob.w;
+    int h = bottom_blob.h;
+    const int size = w * h;
+
+    Mat bottom_im2col = bottom_blob;
+    bottom_im2col.w = size;
+    bottom_im2col.h = 1;
+
+    im2col_sgemm_int8_sse(bottom_im2col, top_blob, kernel, opt);
+}
+
+static void conv1x1s2_sgemm_int8_sse(const Mat& bottom_blob, Mat& top_blob, const Mat& kernel, const Option& opt)
+{
+    int w = bottom_blob.w;
+    int channels = bottom_blob.c;
+    size_t elemsize = bottom_blob.elemsize;
+    int elempack = bottom_blob.elempack;
+
+    int outw = top_blob.w;
+    int outh = top_blob.h;
+
+    const int tailstep = w - 2 * outw + w;
+
+    Mat bottom_blob_shrinked;
+    bottom_blob_shrinked.create(outw, outh, channels, elemsize, elempack, opt.workspace_allocator);
+
+    #pragma omp parallel for num_threads(opt.num_threads)
+    for (int p = 0; p < channels; p++)
+    {
+        const signed char* r0 = bottom_blob.channel(p);
+        signed char* outptr = bottom_blob_shrinked.channel(p);
+
+        for (int i = 0; i < outh; i++)
+        {
+            int j = 0;
+            for (; j + 3 < outw; j += 4)
+            {
+                outptr[0] = r0[0];
+                outptr[1] = r0[2];
+                outptr[2] = r0[4];
+                outptr[3] = r0[6];
+
+                r0 += 8;
+                outptr += 4;
+            }
+            for (; j + 1 < outw; j += 2)
+            {
+                outptr[0] = r0[0];
+                outptr[1] = r0[2];
+
+                r0 += 4;
+                outptr += 2;
+            }
+            for (; j < outw; j++)
+            {
+                outptr[0] = r0[0];
+
+                r0 += 2;
+                outptr += 1;
+            }
+
+            r0 += tailstep;
+        }
+    }
+
+    conv1x1s1_sgemm_int8_sse(bottom_blob_shrinked, top_blob, kernel, opt);
+}
+
+static void conv1x1s1_int8_sse(const Mat& bottom_blob, Mat& top_blob, const Mat& _kernel, const Option& opt)
 {
     int inch = bottom_blob.c;
 
@@ -20,7 +90,7 @@ static void conv1x1s1_int8_sse(const Mat &bottom_blob, Mat &top_blob, const Mat 
     int outh = top_blob.h;
     int outch = top_blob.c;
 
-    const float *kernel = _kernel;
+    const float* kernel = _kernel;
 
     #pragma omp parallel for num_threads(opt.num_threads)
     for (int p = 0; p < outch; p++)
@@ -31,20 +101,20 @@ static void conv1x1s1_int8_sse(const Mat &bottom_blob, Mat &top_blob, const Mat 
 
         int q = 0;
 
-        for (; q+7<inch; q+=8)
+        for (; q + 7 < inch; q += 8)
         {
             int* outptr0 = out0;
 
-            const signed char *kernel0 = (const signed char *)kernel + p * inch + q;
+            const signed char* kernel0 = (const signed char*)kernel + p * inch + q;
 
-            const signed char *r0 = bottom_blob.channel(q);
-            const signed char *r1 = bottom_blob.channel(q + 1);
-            const signed char *r2 = bottom_blob.channel(q + 2);
-            const signed char *r3 = bottom_blob.channel(q + 3);
-            const signed char *r4 = bottom_blob.channel(q + 4);
-            const signed char *r5 = bottom_blob.channel(q + 5);
-            const signed char *r6 = bottom_blob.channel(q + 6);
-            const signed char *r7 = bottom_blob.channel(q + 7);
+            const signed char* r0 = bottom_blob.channel(q);
+            const signed char* r1 = bottom_blob.channel(q + 1);
+            const signed char* r2 = bottom_blob.channel(q + 2);
+            const signed char* r3 = bottom_blob.channel(q + 3);
+            const signed char* r4 = bottom_blob.channel(q + 4);
+            const signed char* r5 = bottom_blob.channel(q + 5);
+            const signed char* r6 = bottom_blob.channel(q + 6);
+            const signed char* r7 = bottom_blob.channel(q + 7);
 
             int size = outw * outh;
             int remain = size;
@@ -52,10 +122,7 @@ static void conv1x1s1_int8_sse(const Mat &bottom_blob, Mat &top_blob, const Mat 
             for (; remain > 0; remain--)
             {
                 //ToDo Neon
-                int sum0 = (int)*r0 * (int)kernel0[0] + (int)*r1 * (int)kernel0[1] +
-                           (int)*r2 * (int)kernel0[2] + (int)*r3 * (int)kernel0[3] +
-                           (int)*r4 * (int)kernel0[4] + (int)*r5 * (int)kernel0[5] +
-                           (int)*r6 * (int)kernel0[6] + (int)*r7 * (int)kernel0[7];
+                int sum0 = (int)*r0 * (int)kernel0[0] + (int)*r1 * (int)kernel0[1] + (int)*r2 * (int)kernel0[2] + (int)*r3 * (int)kernel0[3] + (int)*r4 * (int)kernel0[4] + (int)*r5 * (int)kernel0[5] + (int)*r6 * (int)kernel0[6] + (int)*r7 * (int)kernel0[7];
 
                 *outptr0 += sum0;
 
@@ -71,13 +138,13 @@ static void conv1x1s1_int8_sse(const Mat &bottom_blob, Mat &top_blob, const Mat 
             }
         }
 
-        for (; q<inch; q++)
+        for (; q < inch; q++)
         {
             int* outptr0 = out0;
 
-            const signed char *r0 = bottom_blob.channel(q);
+            const signed char* r0 = bottom_blob.channel(q);
 
-            const signed char *kernel0 = (const signed char *)kernel + p * inch + q;
+            const signed char* kernel0 = (const signed char*)kernel + p * inch + q;
             const signed char k0 = kernel0[0];
 
             int size = outw * outh;
@@ -96,7 +163,7 @@ static void conv1x1s1_int8_sse(const Mat &bottom_blob, Mat &top_blob, const Mat 
     }
 }
 
-static void conv1x1s2_int8_sse(const Mat &bottom_blob, Mat &top_blob, const Mat &_kernel, const Option& opt)
+static void conv1x1s2_int8_sse(const Mat& bottom_blob, Mat& top_blob, const Mat& _kernel, const Option& opt)
 {
     int w = bottom_blob.w;
     int inch = bottom_blob.c;
@@ -105,8 +172,8 @@ static void conv1x1s2_int8_sse(const Mat &bottom_blob, Mat &top_blob, const Mat 
     int outh = top_blob.h;
     int outch = top_blob.c;
 
-    const int tailstep = w - 2*outw + w;
-    const signed char *kernel = _kernel;
+    const int tailstep = w - 2 * outw + w;
+    const signed char* kernel = _kernel;
 
     #pragma omp parallel for num_threads(opt.num_threads)
     for (int p = 0; p < outch; p++)
@@ -117,32 +184,29 @@ static void conv1x1s2_int8_sse(const Mat &bottom_blob, Mat &top_blob, const Mat 
 
         int q = 0;
 
-        for (; q+7<inch; q+=8)
+        for (; q + 7 < inch; q += 8)
         {
             int* outptr0 = out0;
 
-            const signed char *kernel0 = (const signed char *)kernel + p * inch + q;
+            const signed char* kernel0 = (const signed char*)kernel + p * inch + q;
 
-            const signed char *r0 = bottom_blob.channel(q);
-            const signed char *r1 = bottom_blob.channel(q + 1);
-            const signed char *r2 = bottom_blob.channel(q + 2);
-            const signed char *r3 = bottom_blob.channel(q + 3);
-            const signed char *r4 = bottom_blob.channel(q + 4);
-            const signed char *r5 = bottom_blob.channel(q + 5);
-            const signed char *r6 = bottom_blob.channel(q + 6);
-            const signed char *r7 = bottom_blob.channel(q + 7);
+            const signed char* r0 = bottom_blob.channel(q);
+            const signed char* r1 = bottom_blob.channel(q + 1);
+            const signed char* r2 = bottom_blob.channel(q + 2);
+            const signed char* r3 = bottom_blob.channel(q + 3);
+            const signed char* r4 = bottom_blob.channel(q + 4);
+            const signed char* r5 = bottom_blob.channel(q + 5);
+            const signed char* r6 = bottom_blob.channel(q + 6);
+            const signed char* r7 = bottom_blob.channel(q + 7);
 
-            for(int i = 0; i < outh; i++)
+            for (int i = 0; i < outh; i++)
             {
                 int remain = outw;
 
                 for (; remain > 0; remain--)
                 {
                     //ToDo Neon
-                    int sum0 = (int)*r0 * (int)kernel0[0] + (int)*r1 * (int)kernel0[1] +
-                            (int)*r2 * (int)kernel0[2] + (int)*r3 * (int)kernel0[3] +
-                            (int)*r4 * (int)kernel0[4] + (int)*r5 * (int)kernel0[5] +
-                            (int)*r6 * (int)kernel0[6] + (int)*r7 * (int)kernel0[7];
+                    int sum0 = (int)*r0 * (int)kernel0[0] + (int)*r1 * (int)kernel0[1] + (int)*r2 * (int)kernel0[2] + (int)*r3 * (int)kernel0[3] + (int)*r4 * (int)kernel0[4] + (int)*r5 * (int)kernel0[5] + (int)*r6 * (int)kernel0[6] + (int)*r7 * (int)kernel0[7];
 
                     *outptr0 += sum0;
 
@@ -168,15 +232,15 @@ static void conv1x1s2_int8_sse(const Mat &bottom_blob, Mat &top_blob, const Mat 
             }
         }
 
-        for (; q<inch; q++)
+        for (; q < inch; q++)
         {
             int* outptr0 = out0;
 
-            const signed char *r0 = bottom_blob.channel(q);
+            const signed char* r0 = bottom_blob.channel(q);
 
-            const signed char *kernel0 = (const signed char *)kernel + p * inch + q;
+            const signed char* kernel0 = (const signed char*)kernel + p * inch + q;
 
-            for(int i = 0; i < outh; i++)
+            for (int i = 0; i < outh; i++)
             {
                 int remain = outw;
 
@@ -195,48 +259,4 @@ static void conv1x1s2_int8_sse(const Mat &bottom_blob, Mat &top_blob, const Mat 
             }
         }
     }
-}
-
-static void conv1x1s1_int8_dequant_sse(const Mat &bottom_blob, Mat &top_blob, const Mat &_kernel, const Mat &_bias, std::vector<float> scales_dequant, const Option& opt)
-{
-    int kernel_w = 1;
-    int kernel_h = 1;
-
-    int stride_w = 1;
-    int stride_h = 1;
-
-    conv_im2col_sgemm_int8_dequant_sse(bottom_blob, top_blob, _kernel, kernel_w, kernel_h, stride_w, stride_h, _bias, scales_dequant, opt);
-}
-
-static void conv1x1s2_int8_dequant_sse(const Mat &bottom_blob, Mat &top_blob, const Mat &_kernel, const Mat &_bias, std::vector<float> scales_dequant, const Option& opt)
-{
-    int kernel_w = 1;
-    int kernel_h = 1;
-
-    int stride_w = 2;
-    int stride_h = 2;
-
-    conv_im2col_sgemm_int8_dequant_sse(bottom_blob, top_blob, _kernel, kernel_w, kernel_h, stride_w, stride_h, _bias, scales_dequant, opt);
-}
-
-static void conv1x1s1_int8_requant_sse(const Mat &bottom_blob, Mat &top_blob, const Mat &_kernel, const Mat &_bias, std::vector<float> scales_requant, const Option& opt)
-{
-    int kernel_w = 1;
-    int kernel_h = 1;
-
-    int stride_w = 1;
-    int stride_h = 1;
-
-    conv_im2col_sgemm_int8_requant_sse(bottom_blob, top_blob, _kernel, kernel_w, kernel_h, stride_w, stride_h, _bias, scales_requant, opt);
-}
-
-static void conv1x1s2_int8_requant_sse(const Mat &bottom_blob, Mat &top_blob, const Mat &_kernel, const Mat &_bias, std::vector<float> scales_requant, const Option& opt)
-{
-    int kernel_w = 1;
-    int kernel_h = 1;
-
-    int stride_w = 2;
-    int stride_h = 2;
-
-    conv_im2col_sgemm_int8_requant_sse(bottom_blob, top_blob, _kernel, kernel_w, kernel_h, stride_w, stride_h, _bias, scales_requant, opt);
 }

@@ -13,6 +13,7 @@
 // specific language governing permissions and limitations under the License.
 
 #include "lrn_arm.h"
+
 #include <math.h>
 
 #if __ARM_NEON
@@ -21,8 +22,6 @@
 #endif // __ARM_NEON
 
 namespace ncnn {
-
-DEFINE_LAYER_CREATOR(LRN_arm)
 
 int LRN_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 {
@@ -39,7 +38,7 @@ int LRN_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         return -100;
 
     #pragma omp parallel for num_threads(opt.num_threads)
-    for (int q=0; q<channels; q++)
+    for (int q = 0; q < channels; q++)
     {
         const float* ptr = bottom_top_blob.channel(q);
         float* outptr = square_blob.channel(q);
@@ -52,7 +51,7 @@ int LRN_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 #endif // __ARM_NEON
 
 #if __ARM_NEON
-        for (; nn>0; nn--)
+        for (; nn > 0; nn--)
         {
             float32x4_t _p = vld1q_f32(ptr);
             float32x4_t _outp = vmulq_f32(_p, _p);
@@ -62,7 +61,7 @@ int LRN_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
             outptr += 4;
         }
 #endif // __ARM_NEON
-        for (; remain>0; remain--)
+        for (; remain > 0; remain--)
         {
             *outptr = *ptr * *ptr;
 
@@ -82,10 +81,10 @@ int LRN_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         const float alpha_div_size = alpha / local_size;
 
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int q=0; q<channels; q++)
+        for (int q = 0; q < channels; q++)
         {
             // square sum
-            for (int p=q - local_size / 2; p<=q + local_size / 2; p++)
+            for (int p = q - local_size / 2; p <= q + local_size / 2; p++)
             {
                 if (p < 0 || p >= channels)
                     continue;
@@ -101,7 +100,7 @@ int LRN_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 #endif // __ARM_NEON
 
 #if __ARM_NEON
-                for (; nn>0; nn--)
+                for (; nn > 0; nn--)
                 {
                     float32x4_t _sp = vld1q_f32(sptr);
                     float32x4_t _ssp = vld1q_f32(ssptr);
@@ -112,7 +111,7 @@ int LRN_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
                     ssptr += 4;
                 }
 #endif // __ARM_NEON
-                for (; remain>0; remain--)
+                for (; remain > 0; remain--)
                 {
                     *ssptr += *sptr;
                     sptr++;
@@ -134,7 +133,7 @@ int LRN_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
             float32x4_t _bias = vdupq_n_f32(bias);
             float32x4_t _ads = vdupq_n_f32(alpha_div_size);
             float32x4_t _mb = vdupq_n_f32(-beta);
-            for (; nn>0; nn--)
+            for (; nn > 0; nn--)
             {
                 float32x4_t _p = vld1q_f32(ptr);
                 float32x4_t _ssp = vld1q_f32(ssptr);
@@ -148,7 +147,7 @@ int LRN_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
                 ptr += 4;
             }
 #endif // __ARM_NEON
-            for (; remain>0; remain--)
+            for (; remain > 0; remain--)
             {
                 *ptr = *ptr * pow(bias + alpha_div_size * *ssptr, -beta);
 
@@ -200,7 +199,7 @@ int LRN_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         }
 
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int q=0; q<channels; q++)
+        for (int q = 0; q < channels; q++)
         {
             float* ptr = bottom_top_blob.channel(q);
             const Mat m = square_blob_bordered.channel(q);
@@ -215,7 +214,7 @@ int LRN_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 
                     for (int k = 0; k < maxk; k++)
                     {
-                        float val = sptr[ space_ofs[k] ];
+                        float val = sptr[space_ofs[k]];
                         ss += val;
                     }
 

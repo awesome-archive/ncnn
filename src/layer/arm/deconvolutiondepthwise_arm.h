@@ -29,16 +29,23 @@ public:
 
     virtual int forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const;
 
+protected:
+#if NCNN_ARM82
+    int create_pipeline_fp16s(const Option& opt);
+    int forward_fp16s(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const;
+    int forward_fp16sa(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const;
+#endif
+#if NCNN_BF16
+    int forward_bf16s(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const;
+#endif
+
 public:
-    Layer* activation;
     std::vector<ncnn::Layer*> group_ops;
 
-    // packing
-    Mat weight_data_pack4;
+    Mat weight_data_tm;
 
-    Mat weight_data_pack4_groups;
-    Mat weight_data_pack1to4_groups;
-    Mat weight_data_pack4to1_groups;
+    // fp16
+    Mat bias_data_fp16;
 };
 
 } // namespace ncnn

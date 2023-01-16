@@ -31,7 +31,9 @@ public:
 public:
     int squeeze_w;
     int squeeze_h;
+    int squeeze_d;
     int squeeze_c;
+    Mat axes;
 };
 
 } // namespace ncnn

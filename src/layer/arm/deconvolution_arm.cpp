@@ -13,25 +13,35 @@
 // specific language governing permissions and limitations under the License.
 
 #include "deconvolution_arm.h"
+
 #include "layer_type.h"
 
 #if __ARM_NEON
 #include <arm_neon.h>
-#include "neon_mathfun.h"
 #endif // __ARM_NEON
+
+#include "arm_activation.h"
+#include "arm_usability.h"
+
+#include "cpu.h"
 
 namespace ncnn {
 
-#include "deconvolution_4x4.h"
 #include "deconvolution_3x3.h"
-
-DEFINE_LAYER_CREATOR(Deconvolution_arm)
+#include "deconvolution_4x4.h"
 
 Deconvolution_arm::Deconvolution_arm()
 {
 #if __ARM_NEON
     support_packing = true;
+#if NCNN_ARM82
+    support_fp16_storage = cpu_support_arm_asimdhp();
+#endif
 #endif // __ARM_NEON
+
+#if NCNN_BF16
+    support_bf16_storage = true;
+#endif
 
     activation = 0;
 }
@@ -50,7 +60,7 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
         activation = ncnn::create_layer(ncnn::LayerType::ReLU);
 
         ncnn::ParamDict pd;
-        pd.set(0, activation_params[0]);// slope
+        pd.set(0, activation_params[0]); // slope
         activation->load_param(pd);
     }
     else if (activation_type == 3)
@@ -58,8 +68,8 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
         activation = ncnn::create_layer(ncnn::LayerType::Clip);
 
         ncnn::ParamDict pd;
-        pd.set(0, activation_params[0]);// min
-        pd.set(1, activation_params[1]);// max
+        pd.set(0, activation_params[0]); // min
+        pd.set(1, activation_params[1]); // max
         activation->load_param(pd);
     }
     else if (activation_type == 4)
@@ -72,28 +82,36 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
 
     if (activation)
     {
-        Option opt_cpu = opt;
-        opt_cpu.use_vulkan_compute = false;
-        activation->create_pipeline(opt_cpu);
+        activation->create_pipeline(opt);
     }
+
+#if NCNN_ARM82
+    if (support_fp16_storage && opt.use_fp16_storage)
+    {
+        return create_pipeline_fp16s(opt);
+    }
+#endif
+
+#if NCNN_BF16
+    if (opt.use_bf16_storage)
+    {
+        return create_pipeline_bf16s(opt);
+    }
+#endif
 
     const int maxk = kernel_w * kernel_h;
     int num_input = weight_data_size / maxk / num_output;
-
-#if __ARM_NEON
-    if (opt.use_packing_layout)
-    {
 
     Mat weight_data_transposed(weight_data.w);
     {
         float* pt = weight_data_transposed;
         const float* p = weight_data;
 
-        for (int i=0; i<num_input*num_output; i++)
+        for (int i = 0; i < num_input * num_output; i++)
         {
-            for (int k=0; k<maxk; k++)
+            for (int k = 0; k < maxk; k++)
             {
-                pt[maxk-1 - k] = p[k];
+                pt[maxk - 1 - k] = p[k];
             }
 
             p += maxk;
@@ -101,50 +119,59 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
         }
     }
 
+    int elempack = 1;
+    int out_elempack = 1;
+#if __ARM_NEON
+    if (opt.use_packing_layout)
+    {
+        elempack = num_input % 4 == 0 ? 4 : 1;
+        out_elempack = num_output % 4 == 0 ? 4 : 1;
+    }
+#endif
+
+#if __ARM_NEON
     // pack4
-    if (num_input % 4 == 0 && num_output % 4 == 0)
+    if (elempack == 4 && out_elempack == 4)
     {
         // src = kw-kh-inch-outch
-        // dst = 4a-4b-kw-kh-inch/4a-outch/4b
+        // dst = 4b-4a-kw-kh-inch/4a-outch/4b
         {
             Mat weight_data_r2 = weight_data_transposed.reshape(maxk, num_input, num_output);
 
-            weight_data_pack4.create(maxk, num_input/4, num_output/4, (size_t)4*16, 16);
+            weight_data_tm.create(maxk, num_input / 4, num_output / 4, (size_t)4 * 16, 16);
 
-            for (int q=0; q+3<num_output; q+=4)
+            for (int q = 0; q + 3 < num_output; q += 4)
             {
                 const Mat k0 = weight_data_r2.channel(q);
-                const Mat k1 = weight_data_r2.channel(q+1);
-                const Mat k2 = weight_data_r2.channel(q+2);
-                const Mat k3 = weight_data_r2.channel(q+3);
+                const Mat k1 = weight_data_r2.channel(q + 1);
+                const Mat k2 = weight_data_r2.channel(q + 2);
+                const Mat k3 = weight_data_r2.channel(q + 3);
 
-                Mat g0 = weight_data_pack4.channel(q/4);
+                float* g00 = weight_data_tm.channel(q / 4);
 
-                for (int p=0; p+3<num_input; p+=4)
+                for (int p = 0; p + 3 < num_input; p += 4)
                 {
                     const float* k00 = k0.row(p);
-                    const float* k01 = k0.row(p+1);
-                    const float* k02 = k0.row(p+2);
-                    const float* k03 = k0.row(p+3);
+                    const float* k01 = k0.row(p + 1);
+                    const float* k02 = k0.row(p + 2);
+                    const float* k03 = k0.row(p + 3);
 
                     const float* k10 = k1.row(p);
-                    const float* k11 = k1.row(p+1);
-                    const float* k12 = k1.row(p+2);
-                    const float* k13 = k1.row(p+3);
+                    const float* k11 = k1.row(p + 1);
+                    const float* k12 = k1.row(p + 2);
+                    const float* k13 = k1.row(p + 3);
 
                     const float* k20 = k2.row(p);
-                    const float* k21 = k2.row(p+1);
-                    const float* k22 = k2.row(p+2);
-                    const float* k23 = k2.row(p+3);
+                    const float* k21 = k2.row(p + 1);
+                    const float* k22 = k2.row(p + 2);
+                    const float* k23 = k2.row(p + 3);
 
                     const float* k30 = k3.row(p);
-                    const float* k31 = k3.row(p+1);
-                    const float* k32 = k3.row(p+2);
-                    const float* k33 = k3.row(p+3);
+                    const float* k31 = k3.row(p + 1);
+                    const float* k32 = k3.row(p + 2);
+                    const float* k33 = k3.row(p + 3);
 
-                    float* g00 = g0.row(p/4);
-
-                    for (int k=0; k<maxk; k++)
+                    for (int k = 0; k < maxk; k++)
                     {
                         g00[0] = k00[k];
                         g00[1] = k10[k];
@@ -174,34 +201,32 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
     }
 
     // pack1to4
-    if (num_input % 4 != 0 && num_output % 4 == 0)
+    if (elempack == 1 && out_elempack == 4)
     {
         // src = kw-kh-inch-outch
         // dst = 4b-kw-kh-inch-outch/4b
         {
             Mat weight_data_r2 = weight_data_transposed.reshape(maxk, num_input, num_output);
 
-            weight_data_pack1to4.create(maxk, num_input, num_output/4, (size_t)4*4, 4);
+            weight_data_tm.create(maxk, num_input, num_output / 4, (size_t)4 * 4, 4);
 
-            for (int q=0; q+3<num_output; q+=4)
+            for (int q = 0; q + 3 < num_output; q += 4)
             {
                 const Mat k0 = weight_data_r2.channel(q);
-                const Mat k1 = weight_data_r2.channel(q+1);
-                const Mat k2 = weight_data_r2.channel(q+2);
-                const Mat k3 = weight_data_r2.channel(q+3);
+                const Mat k1 = weight_data_r2.channel(q + 1);
+                const Mat k2 = weight_data_r2.channel(q + 2);
+                const Mat k3 = weight_data_r2.channel(q + 3);
 
-                Mat g0 = weight_data_pack1to4.channel(q/4);
+                float* g00 = weight_data_tm.channel(q / 4);
 
-                for (int p=0; p<num_input; p++)
+                for (int p = 0; p < num_input; p++)
                 {
                     const float* k00 = k0.row(p);
                     const float* k10 = k1.row(p);
                     const float* k20 = k2.row(p);
                     const float* k30 = k3.row(p);
 
-                    float* g00 = g0.row(p);
-
-                    for (int k=0; k<maxk; k++)
+                    for (int k = 0; k < maxk; k++)
                     {
                         g00[0] = k00[k];
                         g00[1] = k10[k];
@@ -216,30 +241,28 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
     }
 
     // pack4to1
-    if (num_input % 4 == 0 && num_output % 4 != 0)
+    if (elempack == 4 && out_elempack == 1)
     {
         // src = kw-kh-inch-outch
         // dst = 4a-kw-kh-inch/4a-outch
         {
             Mat weight_data_r2 = weight_data_transposed.reshape(maxk, num_input, num_output);
 
-            weight_data_pack4to1.create(maxk, num_input/4, num_output, (size_t)4*4, 4);
+            weight_data_tm.create(maxk, num_input / 4, num_output, (size_t)4 * 4, 4);
 
-            for (int q=0; q<num_output; q++)
+            for (int q = 0; q < num_output; q++)
             {
                 const Mat k0 = weight_data_r2.channel(q);
-                Mat g0 = weight_data_pack4to1.channel(q);
+                float* g00 = weight_data_tm.channel(q);
 
-                for (int p=0; p+3<num_input; p+=4)
+                for (int p = 0; p + 3 < num_input; p += 4)
                 {
                     const float* k00 = k0.row(p);
-                    const float* k01 = k0.row(p+1);
-                    const float* k02 = k0.row(p+2);
-                    const float* k03 = k0.row(p+3);
+                    const float* k01 = k0.row(p + 1);
+                    const float* k02 = k0.row(p + 2);
+                    const float* k03 = k0.row(p + 3);
 
-                    float* g00 = g0.row(p/4);
-
-                    for (int k=0; k<maxk; k++)
+                    for (int k = 0; k < maxk; k++)
                     {
                         g00[0] = k00[k];
                         g00[1] = k01[k];
@@ -252,9 +275,37 @@ int Deconvolution_arm::create_pipeline(const Option& opt)
             }
         }
     }
-
-    } // opt.use_packing_layout
 #endif // __ARM_NEON
+
+    // pack1
+    if (elempack == 1 && out_elempack == 1)
+    {
+        if (kernel_w == 3 && kernel_h == 3 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1)
+        {
+            weight_data_tm = weight_data;
+        }
+        else if (kernel_w == 3 && kernel_h == 3 && stride_w == 2 && stride_h == 2 && dilation_w == 1 && dilation_h == 1)
+        {
+            weight_data_tm = weight_data;
+        }
+        else if (kernel_w == 4 && kernel_h == 4 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1)
+        {
+            weight_data_tm = weight_data;
+        }
+        else if (kernel_w == 4 && kernel_h == 4 && stride_w == 2 && stride_h == 2 && dilation_w == 1 && dilation_h == 1)
+        {
+            weight_data_tm = weight_data;
+        }
+        else
+        {
+            weight_data_tm = weight_data_transposed;
+        }
+    }
+
+    if (opt.lightmode)
+    {
+        weight_data.release();
+    }
 
     return 0;
 }
@@ -263,9 +314,7 @@ int Deconvolution_arm::destroy_pipeline(const Option& opt)
 {
     if (activation)
     {
-        Option opt_cpu = opt;
-        opt_cpu.use_vulkan_compute = false;
-        activation->destroy_pipeline(opt_cpu);
+        activation->destroy_pipeline(opt);
         delete activation;
         activation = 0;
     }
@@ -275,12 +324,22 @@ int Deconvolution_arm::destroy_pipeline(const Option& opt)
 
 int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
 {
-    // deconvolv with NxN kernel
-    // value = value + bias
+    int elembits = bottom_blob.elembits();
 
-#if __ARM_NEON
-    if (opt.use_packing_layout)
+#if NCNN_ARM82
+    if (support_fp16_storage && opt.use_fp16_storage && elembits == 16)
     {
+        if (opt.use_fp16_arithmetic)
+            return forward_fp16sa(bottom_blob, top_blob, opt);
+        else
+            return forward_fp16s(bottom_blob, top_blob, opt);
+    }
+#endif
+
+#if NCNN_BF16
+    if (opt.use_bf16_storage && elembits == 16)
+        return forward_bf16s(bottom_blob, top_blob, opt);
+#endif
 
     int w = bottom_blob.w;
     int h = bottom_blob.h;
@@ -288,23 +347,24 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
     size_t elemsize = bottom_blob.elemsize;
     int elempack = bottom_blob.elempack;
 
-//     fprintf(stderr, "Deconvolution input %d x %d  pad = %d %d  ksize=%d %d  stride=%d %d\n", w, h, pad_w, pad_h, kernel_w, kernel_h, stride_w, stride_h);
+    //     NCNN_LOGE("Deconvolution input %d x %d  pad = %d %d  ksize=%d %d  stride=%d %d", w, h, pad_w, pad_h, kernel_w, kernel_h, stride_w, stride_h);
 
     const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
     const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
 
-    int outw = (w - 1) * stride_w + kernel_extent_w;
-    int outh = (h - 1) * stride_h + kernel_extent_h;
-    int out_elempack = num_output % 4 == 0 ? 4 : 1;
+    int outw = (w - 1) * stride_w + kernel_extent_w + output_pad_right;
+    int outh = (h - 1) * stride_h + kernel_extent_h + output_pad_bottom;
+    int out_elempack = 1;
+#if __ARM_NEON
+    if (opt.use_packing_layout)
+    {
+        out_elempack = num_output % 4 == 0 ? 4 : 1;
+    }
+#endif
     size_t out_elemsize = elemsize / elempack * out_elempack;
 
     Mat top_blob_bordered;
-    if (output_w == outw && output_h == outh && output_pad_right == 0 && output_pad_bottom == 0)
-    {
-        top_blob_bordered = top_blob;
-        top_blob_bordered.create(outw, outh, num_output / out_elempack, out_elemsize, out_elempack, opt.blob_allocator);
-    }
-    else if (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0 || output_pad_right > 0 || output_pad_bottom > 0 || (output_w > 0 && output_h > 0))
+    if (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0 || (output_w > 0 && output_h > 0))
     {
         top_blob_bordered.create(outw, outh, num_output / out_elempack, out_elemsize, out_elempack, opt.workspace_allocator);
     }
@@ -318,11 +378,12 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
 
     const int maxk = kernel_w * kernel_h;
 
+#if __ARM_NEON
     if (elempack == 4 && out_elempack == 4)
     {
         // num_output
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int p=0; p<num_output / out_elempack; p++)
+        for (int p = 0; p < num_output / out_elempack; p++)
         {
             float* outptr = top_blob_bordered.channel(p);
 
@@ -337,43 +398,43 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         _sum = vld1q_f32(((const float*)bias_data) + p * 4);
                     }
 
-                    const float* kptr = (const float*)weight_data_pack4 + maxk * channels * p * 16;
+                    const float* kptr = weight_data_tm.channel(p);
 
                     // channels
-                    for (int q=0; q<channels; q++)
+                    for (int q = 0; q < channels; q++)
                     {
                         const Mat m = bottom_blob.channel(q);
 
                         for (int y = 0; y < kernel_h; y++)
                         {
                             int sys = (i + y * dilation_h - (kernel_extent_h - 1));
-                            if (sys % stride_h != 0)
+                            if (sys < 0 || sys % stride_h != 0)
                                 continue;
 
                             int sy = sys / stride_h;
-                            if (sy < 0 || sy >= h)
+                            if (sy >= h)
                                 continue;
 
                             for (int x = 0; x < kernel_w; x++)
                             {
                                 int sxs = (j + x * dilation_w - (kernel_extent_w - 1));
-                                if (sxs % stride_w != 0)
+                                if (sxs < 0 || sxs % stride_w != 0)
                                     continue;
 
                                 int sx = sxs / stride_w;
-                                if (sx < 0 || sx >= w)
+                                if (sx >= w)
                                     continue;
 
                                 const float* sptr = m.row(sy) + sx * 4;
 
-                                float32x4_t _val = vld1q_f32( sptr );
+                                float32x4_t _val = vld1q_f32(sptr);
 
                                 int k = y * kernel_w + x;
 
-                                float32x4_t _w0 = vld1q_f32( kptr + k * 16 );
-                                float32x4_t _w1 = vld1q_f32( kptr + k * 16 + 4 );
-                                float32x4_t _w2 = vld1q_f32( kptr + k * 16 + 8 );
-                                float32x4_t _w3 = vld1q_f32( kptr + k * 16 + 12 );
+                                float32x4_t _w0 = vld1q_f32(kptr + k * 16);
+                                float32x4_t _w1 = vld1q_f32(kptr + k * 16 + 4);
+                                float32x4_t _w2 = vld1q_f32(kptr + k * 16 + 8);
+                                float32x4_t _w3 = vld1q_f32(kptr + k * 16 + 12);
 
 #if __aarch64__
                                 _sum = vmlaq_laneq_f32(_sum, _w0, _val, 0);
@@ -392,37 +453,7 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         kptr += maxk * 16;
                     }
 
-                    if (activation_type == 1)
-                    {
-                        float32x4_t _zero = vdupq_n_f32(0.f);
-                        _sum = vmaxq_f32(_sum, _zero);
-                    }
-                    else if (activation_type == 2)
-                    {
-                        float32x4_t _zero = vdupq_n_f32(0.f);
-                        float32x4_t _slope = vdupq_n_f32(activation_params[0]);
-                        uint32x4_t _lemask = vcleq_f32(_sum, _zero);
-                        float32x4_t _ps = vmulq_f32(_sum, _slope);
-                        _sum = vbslq_f32(_lemask, _ps, _sum);
-                    }
-                    else if (activation_type == 3)
-                    {
-                        float32x4_t _min = vdupq_n_f32(activation_params[0]);
-                        float32x4_t _max = vdupq_n_f32(activation_params[1]);
-                        _sum = vmaxq_f32(_sum, _min);
-                        _sum = vminq_f32(_sum, _max);
-                    }
-                    else if (activation_type == 4)
-                    {
-                        float32x4_t _one = vdupq_n_f32(1.f);
-                        _sum = vnegq_f32(_sum);
-                        _sum = exp_ps(_sum);
-                        _sum = vaddq_f32(_sum, _one);
-                        float32x4_t _outp = vrecpeq_f32(_sum);
-                        _outp = vmulq_f32(vrecpsq_f32(_sum, _outp), _outp);
-//                         _outp = vmulq_f32(vrecpsq_f32(_sum, _outp), _outp);
-                        _sum = _outp;
-                    }
+                    _sum = activation_ps(_sum, activation_type, activation_params);
 
                     vst1q_f32(outptr + j * 4, _sum);
                 }
@@ -436,7 +467,7 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
     {
         // num_output
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int p=0; p<num_output / out_elempack; p++)
+        for (int p = 0; p < num_output / out_elempack; p++)
         {
             float* outptr = top_blob_bordered.channel(p);
 
@@ -451,21 +482,21 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         _sum = vld1q_f32(((const float*)bias_data) + p * 4);
                     }
 
-                    const float* kptr = (const float*)weight_data_pack1to4 + maxk * channels * p * 4;
+                    const float* kptr = weight_data_tm.channel(p);
 
                     // channels
-                    for (int q=0; q<channels; q++)
+                    for (int q = 0; q < channels; q++)
                     {
                         const Mat m = bottom_blob.channel(q);
 
                         for (int y = 0; y < kernel_h; y++)
                         {
                             int sys = (i + y * dilation_h - (kernel_extent_h - 1));
-                            if (sys % stride_h != 0)
+                            if (sys < 0 || sys % stride_h != 0)
                                 continue;
 
                             int sy = sys / stride_h;
-                            if (sy < 0 || sy >= h)
+                            if (sy >= h)
                                 continue;
 
                             const float* sptr = m.row(sy);
@@ -473,18 +504,18 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                             for (int x = 0; x < kernel_w; x++)
                             {
                                 int sxs = (j + x * dilation_w - (kernel_extent_w - 1));
-                                if (sxs % stride_w != 0)
+                                if (sxs < 0 || sxs % stride_w != 0)
                                     continue;
 
                                 int sx = sxs / stride_w;
-                                if (sx < 0 || sx >= w)
+                                if (sx >= w)
                                     continue;
 
-                                float32x4_t _val = vdupq_n_f32( sptr[ sx ] );
+                                float32x4_t _val = vdupq_n_f32(sptr[sx]);
 
                                 int k = y * kernel_w + x;
 
-                                float32x4_t _w = vld1q_f32( kptr + k * 4 );
+                                float32x4_t _w = vld1q_f32(kptr + k * 4);
 
                                 _sum = vmlaq_f32(_sum, _val, _w);
                             }
@@ -493,37 +524,7 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         kptr += maxk * 4;
                     }
 
-                    if (activation_type == 1)
-                    {
-                        float32x4_t _zero = vdupq_n_f32(0.f);
-                        _sum = vmaxq_f32(_sum, _zero);
-                    }
-                    else if (activation_type == 2)
-                    {
-                        float32x4_t _zero = vdupq_n_f32(0.f);
-                        float32x4_t _slope = vdupq_n_f32(activation_params[0]);
-                        uint32x4_t _lemask = vcleq_f32(_sum, _zero);
-                        float32x4_t _ps = vmulq_f32(_sum, _slope);
-                        _sum = vbslq_f32(_lemask, _ps, _sum);
-                    }
-                    else if (activation_type == 3)
-                    {
-                        float32x4_t _min = vdupq_n_f32(activation_params[0]);
-                        float32x4_t _max = vdupq_n_f32(activation_params[1]);
-                        _sum = vmaxq_f32(_sum, _min);
-                        _sum = vminq_f32(_sum, _max);
-                    }
-                    else if (activation_type == 4)
-                    {
-                        float32x4_t _one = vdupq_n_f32(1.f);
-                        _sum = vnegq_f32(_sum);
-                        _sum = exp_ps(_sum);
-                        _sum = vaddq_f32(_sum, _one);
-                        float32x4_t _outp = vrecpeq_f32(_sum);
-                        _outp = vmulq_f32(vrecpsq_f32(_sum, _outp), _outp);
-//                         _outp = vmulq_f32(vrecpsq_f32(_sum, _outp), _outp);
-                        _sum = _outp;
-                    }
+                    _sum = activation_ps(_sum, activation_type, activation_params);
 
                     vst1q_f32(outptr + j * 4, _sum);
                 }
@@ -537,7 +538,7 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
     {
         // num_output
         #pragma omp parallel for num_threads(opt.num_threads)
-        for (int p=0; p<num_output / out_elempack; p++)
+        for (int p = 0; p < num_output; p++)
         {
             float* outptr = top_blob_bordered.channel(p);
 
@@ -552,40 +553,40 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         sum = bias_data[p];
                     }
 
-                    const float* kptr = (const float*)weight_data_pack4to1 + maxk * channels * p * 4;
+                    const float* kptr = weight_data_tm.channel(p);
 
                     // channels
-                    for (int q=0; q<channels; q++)
+                    for (int q = 0; q < channels; q++)
                     {
                         const Mat m = bottom_blob.channel(q);
 
                         for (int y = 0; y < kernel_h; y++)
                         {
                             int sys = (i + y * dilation_h - (kernel_extent_h - 1));
-                            if (sys % stride_h != 0)
+                            if (sys < 0 || sys % stride_h != 0)
                                 continue;
 
                             int sy = sys / stride_h;
-                            if (sy < 0 || sy >= h)
+                            if (sy >= h)
                                 continue;
 
                             for (int x = 0; x < kernel_w; x++)
                             {
                                 int sxs = (j + x * dilation_w - (kernel_extent_w - 1));
-                                if (sxs % stride_w != 0)
+                                if (sxs < 0 || sxs % stride_w != 0)
                                     continue;
 
                                 int sx = sxs / stride_w;
-                                if (sx < 0 || sx >= w)
+                                if (sx >= w)
                                     continue;
 
                                 const float* sptr = m.row(sy) + sx * 4;
 
-                                float32x4_t _val = vld1q_f32( sptr );
+                                float32x4_t _val = vld1q_f32(sptr);
 
                                 int k = y * kernel_w + x;
 
-                                float32x4_t _w = vld1q_f32( kptr + k * 4 );
+                                float32x4_t _w = vld1q_f32(kptr + k * 4);
 
                                 float32x4_t _s4 = vmulq_f32(_val, _w);
 #if __aarch64__
@@ -601,28 +602,7 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
                         kptr += maxk * 4;
                     }
 
-                    if (activation_type == 1)
-                    {
-                        sum = std::max(sum, 0.f);
-                    }
-                    else if (activation_type == 2)
-                    {
-                        float slope = activation_params[0];
-                        sum = sum > 0.f ? sum : sum * slope;
-                    }
-                    else if (activation_type == 3)
-                    {
-                        float min = activation_params[0];
-                        float max = activation_params[1];
-                        if (sum < min)
-                            sum = min;
-                        if (sum > max)
-                            sum = max;
-                    }
-                    else if (activation_type == 4)
-                    {
-                        sum = 1.f / (1.f + exp(-sum));
-                    }
+                    sum = activation_ss(sum, activation_type, activation_params);
 
                     outptr[j] = sum;
                 }
@@ -631,205 +611,580 @@ int Deconvolution_arm::forward(const Mat& bottom_blob, Mat& top_blob, const Opti
             }
         }
     }
-
-    if (output_w == outw && output_h == outh && output_pad_right == 0 && output_pad_bottom == 0)
-    {
-        top_blob = top_blob_bordered;
-    }
-    else if (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0)
-    {
-        if (output_pad_right > 0 || output_pad_bottom > 0)
-        {
-            Mat top_blob_unbordered;
-            Option opt_ub = opt;
-            opt_ub.blob_allocator = opt.workspace_allocator;
-            copy_cut_border(top_blob_bordered, top_blob_unbordered, pad_top, pad_bottom, pad_left, pad_right, opt_ub);
-            if (top_blob_unbordered.empty())
-                return -100;
-
-            copy_make_border(top_blob_unbordered, top_blob, 0, output_pad_bottom, 0, output_pad_right, BORDER_CONSTANT, 0.f, opt);
-        }
-        else
-        {
-            copy_cut_border(top_blob_bordered, top_blob, pad_top, pad_bottom, pad_left, pad_right, opt);
-        }
-        if (top_blob.empty())
-            return -100;
-
-        outw = top_blob.w;
-        outh = top_blob.h;
-    }
-    else if (output_w > 0 && output_h > 0)
-    {
-        Mat top_blob_bordered_adj = top_blob_bordered;
-        if (output_pad_right > 0 || output_pad_bottom > 0)
-        {
-            Option opt_b = opt;
-            opt_b.blob_allocator = opt.workspace_allocator;
-            copy_make_border(top_blob_bordered, top_blob_bordered_adj, 0, output_pad_bottom, 0, output_pad_right, BORDER_CONSTANT, 0.f, opt_b);
-            if (top_blob_bordered_adj.empty())
-                return -100;
-        }
-
-        int wcut = top_blob_bordered_adj.w - output_w;
-        int hcut = top_blob_bordered_adj.h - output_h;
-
-        if (pad_left == -233 || pad_right == -233 || pad_top == -233 || pad_bottom == -233)
-        {
-            // onnx padding=SAME_UPPER
-            copy_cut_border(top_blob_bordered_adj, top_blob, hcut / 2, hcut - hcut / 2, wcut / 2, wcut - wcut / 2, opt);
-        }
-        else if (pad_left == -234 || pad_right == -234 || pad_top == -234 || pad_bottom == -234)
-        {
-            // onnx padding=SAME_LOWER
-            copy_cut_border(top_blob_bordered_adj, top_blob, hcut - hcut / 2, hcut / 2, wcut - wcut / 2, wcut / 2, opt);
-        }
-        if (top_blob.empty())
-            return -100;
-
-        outw = top_blob.w;
-        outh = top_blob.h;
-    }
-    else
-    {
-        top_blob = top_blob_bordered;
-    }
-
-    return 0;
-
-    } // opt.use_packing_layout
 #endif // __ARM_NEON
 
-    if (kernel_w != kernel_h || stride_w != stride_h)
+    if (elempack == 1 && out_elempack == 1)
     {
-        return Deconvolution::forward(bottom_blob, top_blob, opt);
-    }
-
-    const int kernel_size = kernel_w;
-    const int stride = stride_w;
-
-    if ((kernel_size != 3 && kernel_size != 4) || stride > 2 || dilation_w != 1 || dilation_h != 1)
-    {
-        return Deconvolution::forward(bottom_blob, top_blob, opt);
-    }
-
-    typedef void (*deconv_func)(const Mat&, Mat&, const Mat&, const Mat&, const Option&);
-
-    // kernel_size x stride
-    deconv_func deconv_func_table[2][2] =
-    {
+        if (kernel_w == 3 && kernel_h == 3 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1)
         {
-            deconv3x3s1_neon,
-            deconv3x3s2_neon
-        },  // kernel_size = 3
+            deconv3x3s1_neon(bottom_blob, top_blob_bordered, weight_data_tm, bias_data, opt);
+
+            if (activation)
+            {
+                activation->forward_inplace(top_blob_bordered, opt);
+            }
+        }
+        else if (kernel_w == 3 && kernel_h == 3 && stride_w == 2 && stride_h == 2 && dilation_w == 1 && dilation_h == 1)
         {
-            deconv4x4s1_neon,
-            deconv4x4s2_neon
-        }   // kernel_size = 4
-    };
+            deconv3x3s2_neon(bottom_blob, top_blob_bordered, weight_data_tm, bias_data, opt);
 
-    deconv_func deconv = deconv_func_table[kernel_size-3][stride-1];
-    if (!deconv)
-    {
-        return Deconvolution::forward(bottom_blob, top_blob, opt);
-    }
-
-    int w = bottom_blob.w;
-    int h = bottom_blob.h;
-    size_t elemsize = bottom_blob.elemsize;
-
-    int outw = (w - 1) * stride + kernel_size;
-    int outh = (h - 1) * stride + kernel_size;
-
-    Mat top_blob_bordered;
-    if (output_w == outw && output_h == outh && output_pad_right == 0 && output_pad_bottom == 0)
-    {
-        top_blob_bordered = top_blob;
-        top_blob_bordered.create(outw, outh, num_output, elemsize, opt.blob_allocator);
-    }
-    else if (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0 || output_pad_right > 0 || output_pad_bottom > 0 || (output_w > 0 && output_h > 0))
-    {
-        top_blob_bordered.create(outw, outh, num_output, elemsize, opt.workspace_allocator);
-    }
-    else
-    {
-        top_blob_bordered = top_blob;
-        top_blob_bordered.create(outw, outh, num_output, elemsize, opt.blob_allocator);
-    }
-    if (top_blob_bordered.empty())
-        return -100;
-
-    deconv(bottom_blob, top_blob_bordered, weight_data, bias_data, opt);
-
-    if (output_w == outw && output_h == outh && output_pad_right == 0 && output_pad_bottom == 0)
-    {
-        top_blob = top_blob_bordered;
-    }
-    else if (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0)
-    {
-        if (output_pad_right > 0 || output_pad_bottom > 0)
+            if (activation)
+            {
+                activation->forward_inplace(top_blob_bordered, opt);
+            }
+        }
+        else if (kernel_w == 4 && kernel_h == 4 && stride_w == 1 && stride_h == 1 && dilation_w == 1 && dilation_h == 1)
         {
-            Mat top_blob_unbordered;
-            Option opt_ub = opt;
-            opt_ub.blob_allocator = opt.workspace_allocator;
-            copy_cut_border(top_blob_bordered, top_blob_unbordered, pad_top, pad_bottom, pad_left, pad_right, opt_ub);
-            if (top_blob_unbordered.empty())
-                return -100;
+            deconv4x4s1_neon(bottom_blob, top_blob_bordered, weight_data_tm, bias_data, opt);
 
-            copy_make_border(top_blob_unbordered, top_blob, 0, output_pad_bottom, 0, output_pad_right, BORDER_CONSTANT, 0.f, opt);
+            if (activation)
+            {
+                activation->forward_inplace(top_blob_bordered, opt);
+            }
+        }
+        else if (kernel_w == 4 && kernel_h == 4 && stride_w == 2 && stride_h == 2 && dilation_w == 1 && dilation_h == 1)
+        {
+            deconv4x4s2_neon(bottom_blob, top_blob_bordered, weight_data_tm, bias_data, opt);
+
+            if (activation)
+            {
+                activation->forward_inplace(top_blob_bordered, opt);
+            }
         }
         else
         {
-            copy_cut_border(top_blob_bordered, top_blob, pad_top, pad_bottom, pad_left, pad_right, opt);
-        }
-        if (top_blob.empty())
-            return -100;
+            // num_output
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int p = 0; p < num_output; p++)
+            {
+                float* outptr = top_blob_bordered.channel(p);
 
-        outw = top_blob.w;
-        outh = top_blob.h;
+                for (int i = 0; i < outh; i++)
+                {
+                    for (int j = 0; j < outw; j++)
+                    {
+                        float sum = 0.f;
+
+                        if (bias_term)
+                        {
+                            sum = bias_data[p];
+                        }
+
+                        const float* kptr = (const float*)weight_data_tm + maxk * channels * p;
+
+                        // channels
+                        for (int q = 0; q < channels; q++)
+                        {
+                            const Mat m = bottom_blob.channel(q);
+
+                            for (int y = 0; y < kernel_h; y++)
+                            {
+                                int sys = (i + y * dilation_h - (kernel_extent_h - 1));
+                                if (sys < 0 || sys % stride_h != 0)
+                                    continue;
+
+                                int sy = sys / stride_h;
+                                if (sy >= h)
+                                    continue;
+
+                                const float* sptr = m.row(sy);
+
+                                for (int x = 0; x < kernel_w; x++)
+                                {
+                                    int sxs = (j + x * dilation_w - (kernel_extent_w - 1));
+                                    if (sxs < 0 || sxs % stride_w != 0)
+                                        continue;
+
+                                    int sx = sxs / stride_w;
+                                    if (sx >= w)
+                                        continue;
+
+                                    float val = sptr[sx];
+
+                                    int k = y * kernel_w + x;
+
+                                    float w = kptr[k];
+
+                                    sum += val * w;
+                                }
+                            }
+
+                            kptr += maxk;
+                        }
+
+                        sum = activation_ss(sum, activation_type, activation_params);
+
+                        outptr[j] = sum;
+                    }
+
+                    outptr += outw;
+                }
+            }
+        }
     }
-    else if (output_w > 0 && output_h > 0)
+
+    cut_padding(top_blob_bordered, top_blob, opt);
+    if (top_blob.empty())
+        return -100;
+
+    return 0;
+}
+
+#if NCNN_BF16
+int Deconvolution_arm::create_pipeline_bf16s(const Option& opt)
+{
+    const int maxk = kernel_w * kernel_h;
+    const int num_input = weight_data_size / maxk / num_output;
+
+    int elempack = 1;
+    int out_elempack = 1;
+#if __ARM_NEON
+    if (opt.use_packing_layout)
     {
-        Mat top_blob_bordered_adj = top_blob_bordered;
-        if (output_pad_right > 0 || output_pad_bottom > 0)
-        {
-            Option opt_b = opt;
-            opt_b.blob_allocator = opt.workspace_allocator;
-            copy_make_border(top_blob_bordered, top_blob_bordered_adj, 0, output_pad_bottom, 0, output_pad_right, BORDER_CONSTANT, 0.f, opt_b);
-            if (top_blob_bordered_adj.empty())
-                return -100;
-        }
-
-        int wcut = top_blob_bordered_adj.w - output_w;
-        int hcut = top_blob_bordered_adj.h - output_h;
-
-        if (pad_left == -233 || pad_right == -233 || pad_top == -233 || pad_bottom == -233)
-        {
-            // onnx padding=SAME_UPPER
-            copy_cut_border(top_blob_bordered_adj, top_blob, hcut / 2, hcut - hcut / 2, wcut / 2, wcut - wcut / 2, opt);
-        }
-        else if (pad_left == -234 || pad_right == -234 || pad_top == -234 || pad_bottom == -234)
-        {
-            // onnx padding=SAME_LOWER
-            copy_cut_border(top_blob_bordered_adj, top_blob, hcut - hcut / 2, hcut / 2, wcut - wcut / 2, wcut / 2, opt);
-        }
-        if (top_blob.empty())
-            return -100;
-
-        outw = top_blob.w;
-        outh = top_blob.h;
+        elempack = num_input % 4 == 0 ? 4 : 1;
+        out_elempack = num_output % 4 == 0 ? 4 : 1;
     }
-    else
+#endif
+
+    Mat weight_data_transposed(weight_data.w);
     {
-        top_blob = top_blob_bordered;
+        float* pt = weight_data_transposed;
+        const float* p = weight_data;
+
+        for (int i = 0; i < num_input * num_output; i++)
+        {
+            for (int k = 0; k < maxk; k++)
+            {
+                pt[maxk - 1 - k] = p[k];
+            }
+
+            p += maxk;
+            pt += maxk;
+        }
     }
 
-    if (activation)
+    // src = kw-kh-inch-outch
+    // dst = pb-pa-kw-kh-inch/pa-outch/pb
     {
-        activation->forward_inplace(top_blob, opt);
+        Mat weight_data_r2 = weight_data_transposed.reshape(maxk, num_input, num_output);
+
+        weight_data_tm.create(maxk, num_input / elempack, num_output / out_elempack, (size_t)2u * elempack * out_elempack, elempack * out_elempack);
+
+        for (int q = 0; q + (out_elempack - 1) < num_output; q += out_elempack)
+        {
+            unsigned short* g00 = weight_data_tm.channel(q / out_elempack);
+
+            for (int p = 0; p + (elempack - 1) < num_input; p += elempack)
+            {
+                for (int k = 0; k < maxk; k++)
+                {
+                    for (int i = 0; i < elempack; i++)
+                    {
+                        for (int j = 0; j < out_elempack; j++)
+                        {
+                            const float* k00 = weight_data_r2.channel(q + j).row(p + i);
+
+                            g00[0] = float32_to_bfloat16(k00[k]);
+
+                            g00++;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if (opt.lightmode)
+    {
+        weight_data.release();
     }
 
     return 0;
 }
+
+int Deconvolution_arm::forward_bf16s(const Mat& bottom_blob, Mat& top_blob, const Option& opt) const
+{
+    // deconvolv with NxN kernel
+    // value = value + bias
+
+    int w = bottom_blob.w;
+    int h = bottom_blob.h;
+    int channels = bottom_blob.c;
+    size_t elemsize = bottom_blob.elemsize;
+    int elempack = bottom_blob.elempack;
+
+    //     NCNN_LOGE("Deconvolution input %d x %d  pad = %d %d  ksize=%d %d  stride=%d %d", w, h, pad_w, pad_h, kernel_w, kernel_h, stride_w, stride_h);
+
+    const int kernel_extent_w = dilation_w * (kernel_w - 1) + 1;
+    const int kernel_extent_h = dilation_h * (kernel_h - 1) + 1;
+
+    int outw = (w - 1) * stride_w + kernel_extent_w + output_pad_right;
+    int outh = (h - 1) * stride_h + kernel_extent_h + output_pad_bottom;
+    int out_elempack = 1;
+#if __ARM_NEON
+    if (opt.use_packing_layout)
+    {
+        out_elempack = num_output % 4 == 0 ? 4 : 1;
+    }
+#endif
+    size_t out_elemsize = elemsize / elempack * out_elempack;
+
+    Mat top_blob_bordered;
+    if (pad_left > 0 || pad_right > 0 || pad_top > 0 || pad_bottom > 0 || (output_w > 0 && output_h > 0))
+    {
+        top_blob_bordered.create(outw, outh, num_output / out_elempack, out_elemsize, out_elempack, opt.workspace_allocator);
+    }
+    else
+    {
+        top_blob_bordered = top_blob;
+        top_blob_bordered.create(outw, outh, num_output / out_elempack, out_elemsize, out_elempack, opt.blob_allocator);
+    }
+    if (top_blob_bordered.empty())
+        return -100;
+
+    const int maxk = kernel_w * kernel_h;
+
+#if __ARM_NEON
+    if (elempack == 4 && out_elempack == 4)
+    {
+        {
+            // num_output
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int p = 0; p < num_output / out_elempack; p++)
+            {
+                unsigned short* outptr = top_blob_bordered.channel(p);
+
+                for (int i = 0; i < outh; i++)
+                {
+                    for (int j = 0; j < outw; j++)
+                    {
+                        float32x4_t _sum = vdupq_n_f32(0.f);
+
+                        if (bias_term)
+                        {
+                            _sum = vld1q_f32(((const float*)bias_data) + p * 4);
+                        }
+
+                        const unsigned short* kptr = weight_data_tm.channel(p);
+
+                        // channels
+                        for (int q = 0; q < channels; q++)
+                        {
+                            const Mat m = bottom_blob.channel(q);
+
+                            for (int y = 0; y < kernel_h; y++)
+                            {
+                                int sys = (i + y * dilation_h - (kernel_extent_h - 1));
+                                if (sys < 0 || sys % stride_h != 0)
+                                    continue;
+
+                                int sy = sys / stride_h;
+                                if (sy >= h)
+                                    continue;
+
+                                for (int x = 0; x < kernel_w; x++)
+                                {
+                                    int sxs = (j + x * dilation_w - (kernel_extent_w - 1));
+                                    if (sxs < 0 || sxs % stride_w != 0)
+                                        continue;
+
+                                    int sx = sxs / stride_w;
+                                    if (sx >= w)
+                                        continue;
+
+                                    const unsigned short* sptr = m.row<const unsigned short>(sy) + sx * 4;
+
+                                    float32x4_t _val = bfloat2float(vld1_u16(sptr));
+
+                                    int k = y * kernel_w + x;
+
+                                    float32x4_t _w0 = bfloat2float(vld1_u16(kptr + k * 16));
+                                    float32x4_t _w1 = bfloat2float(vld1_u16(kptr + k * 16 + 4));
+                                    float32x4_t _w2 = bfloat2float(vld1_u16(kptr + k * 16 + 8));
+                                    float32x4_t _w3 = bfloat2float(vld1_u16(kptr + k * 16 + 12));
+
+#if __aarch64__
+                                    _sum = vmlaq_laneq_f32(_sum, _w0, _val, 0);
+                                    _sum = vmlaq_laneq_f32(_sum, _w1, _val, 1);
+                                    _sum = vmlaq_laneq_f32(_sum, _w2, _val, 2);
+                                    _sum = vmlaq_laneq_f32(_sum, _w3, _val, 3);
+#else
+                                    _sum = vmlaq_lane_f32(_sum, _w0, vget_low_f32(_val), 0);
+                                    _sum = vmlaq_lane_f32(_sum, _w1, vget_low_f32(_val), 1);
+                                    _sum = vmlaq_lane_f32(_sum, _w2, vget_high_f32(_val), 0);
+                                    _sum = vmlaq_lane_f32(_sum, _w3, vget_high_f32(_val), 1);
+#endif
+                                }
+                            }
+
+                            kptr += maxk * 16;
+                        }
+
+                        _sum = activation_ps(_sum, activation_type, activation_params);
+
+                        vst1_u16(outptr + j * 4, float2bfloat(_sum));
+                    }
+
+                    outptr += outw * 4;
+                }
+            }
+        }
+    }
+
+    if (elempack == 1 && out_elempack == 4)
+    {
+        {
+            // num_output
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int p = 0; p < num_output / out_elempack; p++)
+            {
+                unsigned short* outptr = top_blob_bordered.channel(p);
+
+                for (int i = 0; i < outh; i++)
+                {
+                    for (int j = 0; j < outw; j++)
+                    {
+                        float32x4_t _sum = vdupq_n_f32(0.f);
+
+                        if (bias_term)
+                        {
+                            _sum = vld1q_f32(((const float*)bias_data) + p * 4);
+                        }
+
+                        const unsigned short* kptr = weight_data_tm.channel(p);
+
+                        // channels
+                        for (int q = 0; q < channels; q++)
+                        {
+                            const Mat m = bottom_blob.channel(q);
+
+                            for (int y = 0; y < kernel_h; y++)
+                            {
+                                int sys = (i + y * dilation_h - (kernel_extent_h - 1));
+                                if (sys < 0 || sys % stride_h != 0)
+                                    continue;
+
+                                int sy = sys / stride_h;
+                                if (sy >= h)
+                                    continue;
+
+                                const unsigned short* sptr = m.row<const unsigned short>(sy);
+
+                                for (int x = 0; x < kernel_w; x++)
+                                {
+                                    int sxs = (j + x * dilation_w - (kernel_extent_w - 1));
+                                    if (sxs < 0 || sxs % stride_w != 0)
+                                        continue;
+
+                                    int sx = sxs / stride_w;
+                                    if (sx >= w)
+                                        continue;
+
+                                    float32x4_t _val = vdupq_n_f32(bfloat16_to_float32(sptr[sx]));
+
+                                    int k = y * kernel_w + x;
+
+                                    float32x4_t _w = bfloat2float(vld1_u16(kptr + k * 4));
+
+                                    _sum = vmlaq_f32(_sum, _val, _w);
+                                }
+                            }
+
+                            kptr += maxk * 4;
+                        }
+
+                        _sum = activation_ps(_sum, activation_type, activation_params);
+
+                        vst1_u16(outptr + j * 4, float2bfloat(_sum));
+                    }
+
+                    outptr += outw * 4;
+                }
+            }
+        }
+    }
+
+    if (elempack == 4 && out_elempack == 1)
+    {
+        {
+            // num_output
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int p = 0; p < num_output / out_elempack; p++)
+            {
+                unsigned short* outptr = top_blob_bordered.channel(p);
+
+                for (int i = 0; i < outh; i++)
+                {
+                    for (int j = 0; j < outw; j++)
+                    {
+                        float sum = 0.f;
+
+                        if (bias_term)
+                        {
+                            sum = bias_data[p];
+                        }
+
+                        const unsigned short* kptr = weight_data_tm.channel(p);
+
+                        // channels
+                        for (int q = 0; q < channels; q++)
+                        {
+                            const Mat m = bottom_blob.channel(q);
+
+                            for (int y = 0; y < kernel_h; y++)
+                            {
+                                int sys = (i + y * dilation_h - (kernel_extent_h - 1));
+                                if (sys < 0 || sys % stride_h != 0)
+                                    continue;
+
+                                int sy = sys / stride_h;
+                                if (sy >= h)
+                                    continue;
+
+                                for (int x = 0; x < kernel_w; x++)
+                                {
+                                    int sxs = (j + x * dilation_w - (kernel_extent_w - 1));
+                                    if (sxs < 0 || sxs % stride_w != 0)
+                                        continue;
+
+                                    int sx = sxs / stride_w;
+                                    if (sx >= w)
+                                        continue;
+
+                                    const unsigned short* sptr = m.row<const unsigned short>(sy) + sx * 4;
+
+                                    float32x4_t _val = bfloat2float(vld1_u16(sptr));
+
+                                    int k = y * kernel_w + x;
+
+                                    float32x4_t _w = bfloat2float(vld1_u16(kptr + k * 4));
+
+                                    float32x4_t _s4 = vmulq_f32(_val, _w);
+#if __aarch64__
+                                    sum += vaddvq_f32(_s4); // dot
+#else
+                                    float32x2_t _ss = vadd_f32(vget_low_f32(_s4), vget_high_f32(_s4));
+                                    _ss = vpadd_f32(_ss, _ss);
+                                    sum += vget_lane_f32(_ss, 0);
+#endif
+                                }
+                            }
+
+                            kptr += maxk * 4;
+                        }
+
+                        sum = activation_ss(sum, activation_type, activation_params);
+
+                        outptr[j] = float32_to_bfloat16(sum);
+                    }
+
+                    outptr += outw;
+                }
+            }
+        }
+    }
+#endif // __ARM_NEON
+
+    if (elempack == 1 && out_elempack == 1)
+    {
+        {
+            // num_output
+            #pragma omp parallel for num_threads(opt.num_threads)
+            for (int p = 0; p < num_output; p++)
+            {
+                unsigned short* outptr = top_blob_bordered.channel(p);
+
+                for (int i = 0; i < outh; i++)
+                {
+                    for (int j = 0; j < outw; j++)
+                    {
+                        float sum = 0.f;
+
+                        if (bias_term)
+                        {
+                            sum = bias_data[p];
+                        }
+
+                        const unsigned short* kptr = weight_data_tm.channel(p);
+
+                        // channels
+                        for (int q = 0; q < channels; q++)
+                        {
+                            const Mat m = bottom_blob.channel(q);
+
+                            for (int y = 0; y < kernel_h; y++)
+                            {
+                                int sys = (i + y * dilation_h - (kernel_extent_h - 1));
+                                if (sys < 0 || sys % stride_h != 0)
+                                    continue;
+
+                                int sy = sys / stride_h;
+                                if (sy >= h)
+                                    continue;
+
+                                const unsigned short* sptr = m.row<const unsigned short>(sy);
+
+                                for (int x = 0; x < kernel_w; x++)
+                                {
+                                    int sxs = (j + x * dilation_w - (kernel_extent_w - 1));
+                                    if (sxs < 0 || sxs % stride_w != 0)
+                                        continue;
+
+                                    int sx = sxs / stride_w;
+                                    if (sx >= w)
+                                        continue;
+
+                                    float val = bfloat16_to_float32(sptr[sx]);
+
+                                    int k = y * kernel_w + x;
+
+                                    float w = bfloat16_to_float32(kptr[k]);
+
+                                    sum += val * w;
+                                }
+                            }
+
+                            kptr += maxk;
+                        }
+
+                        if (activation_type == 1)
+                        {
+                            sum = std::max(sum, 0.f);
+                        }
+                        else if (activation_type == 2)
+                        {
+                            float slope = activation_params[0];
+                            sum = sum > 0.f ? sum : sum * slope;
+                        }
+                        else if (activation_type == 3)
+                        {
+                            float min = activation_params[0];
+                            float max = activation_params[1];
+                            if (sum < min)
+                                sum = min;
+                            if (sum > max)
+                                sum = max;
+                        }
+                        else if (activation_type == 4)
+                        {
+                            sum = static_cast<float>(1.f / (1.f + exp(-sum)));
+                        }
+
+                        outptr[j] = float32_to_bfloat16(sum);
+                    }
+
+                    outptr += outw;
+                }
+            }
+        }
+    }
+
+    cut_padding(top_blob_bordered, top_blob, opt);
+    if (top_blob.empty())
+        return -100;
+
+    return 0;
+}
+#endif // NCNN_BF16
 
 } // namespace ncnn

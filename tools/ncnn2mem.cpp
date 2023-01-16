@@ -12,24 +12,26 @@
 // CONDITIONS OF ANY KIND, either express or implied. See the License for the
 // specific language governing permissions and limitations under the License.
 
+#include "layer.h"
+#include "layer_type.h"
+
+#include <cstddef>
 #include <ctype.h>
 #include <stdio.h>
 #include <string.h>
-#include <cstddef>
 #include <string>
 #include <vector>
-#include "layer.h"
 
 static std::vector<std::string> layer_names;
 static std::vector<std::string> blob_names;
 
 static int find_blob_index_by_name(const char* name)
 {
-    for (std::size_t i=0; i<blob_names.size(); i++)
+    for (std::size_t i = 0; i < blob_names.size(); i++)
     {
         if (blob_names[i] == name)
         {
-            return i;
+            return static_cast<int>(i);
         }
     }
 
@@ -39,7 +41,7 @@ static int find_blob_index_by_name(const char* name)
 
 static void sanitize_name(char* name)
 {
-    for (std::size_t i=0; i<strlen(name); i++)
+    for (std::size_t i = 0; i < strlen(name); i++)
     {
         if (!isalnum(name[i]))
         {
@@ -62,7 +64,7 @@ static std::string path_to_varname(const char* path)
 static bool vstr_is_float(const char vstr[16])
 {
     // look ahead for determine isfloat
-    for (int j=0; j<16; j++)
+    for (int j = 0; j < 16; j++)
     {
         if (vstr[j] == '\0')
             break;
@@ -74,11 +76,92 @@ static bool vstr_is_float(const char vstr[16])
     return false;
 }
 
+static float vstr_to_float(const char vstr[16])
+{
+    double v = 0.0;
+
+    const char* p = vstr;
+
+    // sign
+    bool sign = *p != '-';
+    if (*p == '+' || *p == '-')
+    {
+        p++;
+    }
+
+    // digits before decimal point or exponent
+    unsigned int v1 = 0;
+    while (isdigit(*p))
+    {
+        v1 = v1 * 10 + (*p - '0');
+        p++;
+    }
+
+    v = (double)v1;
+
+    // digits after decimal point
+    if (*p == '.')
+    {
+        p++;
+
+        unsigned int pow10 = 1;
+        unsigned int v2 = 0;
+
+        while (isdigit(*p))
+        {
+            v2 = v2 * 10 + (*p - '0');
+            pow10 *= 10;
+            p++;
+        }
+
+        v += v2 / (double)pow10;
+    }
+
+    // exponent
+    if (*p == 'e' || *p == 'E')
+    {
+        p++;
+
+        // sign of exponent
+        bool fact = *p != '-';
+        if (*p == '+' || *p == '-')
+        {
+            p++;
+        }
+
+        // digits of exponent
+        unsigned int expon = 0;
+        while (isdigit(*p))
+        {
+            expon = expon * 10 + (*p - '0');
+            p++;
+        }
+
+        double scale = 1.0;
+        while (expon >= 8)
+        {
+            scale *= 1e8;
+            expon -= 8;
+        }
+        while (expon > 0)
+        {
+            scale *= 10.0;
+            expon -= 1;
+        }
+
+        v = fact ? v * scale : v / scale;
+    }
+
+    //     fprintf(stderr, "v = %f\n", v);
+    return sign ? (float)v : (float)-v;
+}
+
 static int dump_param(const char* parampath, const char* parambinpath, const char* idcpppath)
 {
     FILE* fp = fopen(parampath, "rb");
 
-    if (!fp){
+    if (!fp)
+    {
         fprintf(stderr, "fopen %s failed\n", parampath);
         return -1;
     }
@@ -118,8 +201,10 @@ static int dump_param(const char* parampath, const char* parambinpath, const cha
     layer_names.resize(layer_count);
     blob_names.resize(blob_count);
 
+    std::vector<std::string> custom_layer_index;
+
     int blob_index = 0;
-    for (int i=0; i<layer_count; i++)
+    for (int i = 0; i < layer_count; i++)
     {
         char layer_type[33];
         char layer_name[257];
@@ -135,6 +220,26 @@ static int dump_param(const char* parampath, const char* parambinpath, const cha
         sanitize_name(layer_name);
 
         int typeindex = ncnn::layer_to_index(layer_type);
+        if (typeindex == -1)
+        {
+            // lookup custom_layer_index
+            for (size_t j = 0; j < custom_layer_index.size(); j++)
+            {
+                if (custom_layer_index[j] == layer_type)
+                {
+                    typeindex = ncnn::LayerType::CustomBit | j;
+                    break;
+                }
+            }
+
+            if (typeindex == -1)
+            {
+                // new custom layer type
+                size_t j = custom_layer_index.size();
+                custom_layer_index.push_back(layer_type);
+                typeindex = ncnn::LayerType::CustomBit | j;
+            }
+        }
         fwrite(&typeindex, sizeof(int), 1, mp);
 
         fwrite(&bottom_count, sizeof(int), 1, mp);
@@ -142,8 +247,8 @@ static int dump_param(const char* parampath, const char* parambinpath, const cha
 
         fprintf(ip, "const int LAYER_%s = %d;\n", layer_name, i);
 
-//         layer->bottoms.resize(bottom_count);
-        for (int j=0; j<bottom_count; j++)
+        //         layer->bottoms.resize(bottom_count);
+        for (int j = 0; j < bottom_count; j++)
         {
             char bottom_name[257];
             nscan = fscanf(fp, "%256s", bottom_name);
@@ -160,8 +265,8 @@ static int dump_param(const char* parampath, const char* parambinpath, const cha
             fwrite(&bottom_blob_index, sizeof(int), 1, mp);
         }
 
-//         layer->tops.resize(top_count);
-        for (int j=0; j<top_count; j++)
+        //         layer->tops.resize(top_count);
+        for (int j = 0; j < top_count; j++)
         {
             char blob_name[257];
             nscan = fscanf(fp, "%256s", blob_name);
@@ -216,8 +321,7 @@ static int dump_param(const char* parampath, const char* parambinpath, const cha
 
                     if (is_float)
                     {
-                        float vf;
-                        sscanf(vstr, "%f", &vf);
+                        float vf = vstr_to_float(vstr);
                         fwrite(&vf, sizeof(float), 1, mp);
                     }
                     else
@@ -242,8 +346,7 @@ static int dump_param(const char* parampath, const char* parambinpath, const cha
 
                 if (is_float)
                 {
-                    float vf;
-                    sscanf(vstr, "%f", &vf);
+                    float vf = vstr_to_float(vstr);
                     fwrite(&vf, sizeof(float), 1, mp);
                 }
                 else
@@ -259,6 +362,17 @@ static int dump_param(const char* parampath, const char* parambinpath, const cha
         fwrite(&EOP, sizeof(int), 1, mp);
 
         layer_names[i] = std::string(layer_name);
+    }
+
+    // dump custom layer index
+    for (size_t j = 0; j < custom_layer_index.size(); j++)
+    {
+        const std::string& layer_type = custom_layer_index[j];
+        int typeindex = ncnn::LayerType::CustomBit | j;
+
+        fprintf(ip, "const int TYPEINDEX_%s = %d;\n", layer_type.c_str(), typeindex);
+
+        fprintf(stderr, "net.register_custom_layer(%s_id::TYPEINDEX_%s, %s_layer_creator);\n", param_var.c_str(), layer_type.c_str(), layer_type.c_str());
     }
 
     fprintf(ip, "} // namespace %s_id\n", param_var.c_str());
@@ -283,7 +397,8 @@ static int write_memcpp(const char* parambinpath, const char* modelpath, const c
 
     FILE* mp = fopen(parambinpath, "rb");
 
-    if (!mp){
+    if (!mp)
+    {
         fprintf(stderr, "fopen %s failed\n", parambinpath);
         return -1;
     }
@@ -318,7 +433,8 @@ static int write_memcpp(const char* parambinpath, const char* modelpath, const c
 
     FILE* bp = fopen(modelpath, "rb");
 
-    if (!bp){
+    if (!bp)
+    {
         fprintf(stderr, "fopen %s failed\n", modelpath);
         return -1;
     }
@@ -365,10 +481,7 @@ int main(int argc, char** argv)
     const char* idcpppath = argv[3];
     const char* memcpppath = argv[4];
 
-    const char* lastslash = strrchr(parampath, '/');
-    const char* name = lastslash == NULL ? parampath : lastslash + 1;
-
-    std::string parambinpath = std::string(name) + ".bin";
+    std::string parambinpath = std::string(parampath) + ".bin";
 
     dump_param(parampath, parambinpath.c_str(), idcpppath);
 

@@ -14,6 +14,7 @@
 
 #include <float.h>
 #include <stdio.h>
+#include <string.h>
 
 #ifdef _WIN32
 #include <algorithm>
@@ -22,83 +23,33 @@
 #include <unistd.h> // sleep()
 #endif
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 #include "benchmark.h"
 #include "cpu.h"
+#include "datareader.h"
 #include "net.h"
-
-#if NCNN_VULKAN
 #include "gpu.h"
 
-class GlobalGpuInstance
+class DataReaderFromEmpty : public ncnn::DataReader
 {
 public:
-    GlobalGpuInstance() { ncnn::create_gpu_instance(); }
-    ~GlobalGpuInstance() { ncnn::destroy_gpu_instance(); }
-};
-// initialize vulkan runtime before main()
-GlobalGpuInstance g_global_gpu_instance;
-#endif // NCNN_VULKAN
-
-namespace ncnn {
-
-// always return empty weights
-class ModelBinFromEmpty : public ModelBin
-{
-public:
-    virtual Mat load(int w, int /*type*/) const { return Mat(w); }
-};
-
-class BenchNet : public Net
-{
-public:
-    int load_model()
+    virtual int scan(const char* format, void* p) const
     {
-        // load file
-        int ret = 0;
-
-        ModelBinFromEmpty mb;
-        for (size_t i=0; i<layers.size(); i++)
-        {
-            Layer* layer = layers[i];
-
-            int lret = layer->load_model(mb);
-            if (lret != 0)
-            {
-                fprintf(stderr, "layer load_model %d failed\n", (int)i);
-                ret = -1;
-                break;
-            }
-
-            int cret = layer->create_pipeline(opt);
-            if (cret != 0)
-            {
-                fprintf(stderr, "layer create_pipeline %d failed\n", (int)i);
-                ret = -1;
-                break;
-            }
-        }
-
-#if NCNN_VULKAN
-        if (opt.use_vulkan_compute)
-        {
-            upload_model();
-
-            create_pipeline();
-        }
-#endif // NCNN_VULKAN
-
-        fuse_network();
-
-        return ret;
+        return 0;
+    }
+    virtual size_t read(void* buf, size_t size) const
+    {
+        memset(buf, 0, size);
+        return size;
     }
 };
 
-} // namespace ncnn
-
-static int g_warmup_loop_count = 3;
+static int g_warmup_loop_count = 8;
 static int g_loop_count = 4;
-
-static ncnn::Option g_default_option;
+static bool g_enable_cooling_down = true;
 
 static ncnn::UnlockedPoolAllocator g_blob_pool_allocator;
 static ncnn::PoolAllocator g_workspace_pool_allocator;
@@ -109,11 +60,25 @@ static ncnn::VkAllocator* g_blob_vkallocator = 0;
 static ncnn::VkAllocator* g_staging_vkallocator = 0;
 #endif // NCNN_VULKAN
 
-void benchmark(const char* comment, const ncnn::Mat& in)
+void benchmark(const char* comment, const ncnn::Mat& _in, const ncnn::Option& opt)
 {
-    ncnn::BenchNet net;
+    ncnn::Mat in = _in;
+    in.fill(0.01f);
 
-    net.opt = g_default_option;
+    g_blob_pool_allocator.clear();
+    g_workspace_pool_allocator.clear();
+
+#if NCNN_VULKAN
+    if (opt.use_vulkan_compute)
+    {
+        g_blob_vkallocator->clear();
+        g_staging_vkallocator->clear();
+    }
+#endif // NCNN_VULKAN
+
+    ncnn::Net net;
+
+    net.opt = opt;
 
 #if NCNN_VULKAN
     if (net.opt.use_vulkan_compute)
@@ -122,52 +87,61 @@ void benchmark(const char* comment, const ncnn::Mat& in)
     }
 #endif // NCNN_VULKAN
 
+#ifdef __EMSCRIPTEN__
+#define MODEL_DIR "/working/"
+#else
+#define MODEL_DIR ""
+#endif
+
     char parampath[256];
-    sprintf(parampath, "%s.param", comment);
+    sprintf(parampath, MODEL_DIR "%s.param", comment);
     net.load_param(parampath);
 
-    net.load_model();
+    DataReaderFromEmpty dr;
+    net.load_model(dr);
 
-    g_blob_pool_allocator.clear();
-    g_workspace_pool_allocator.clear();
+    const std::vector<const char*>& input_names = net.input_names();
+    const std::vector<const char*>& output_names = net.output_names();
 
-#if NCNN_VULKAN
-    if (net.opt.use_vulkan_compute)
+    if (g_enable_cooling_down)
     {
-        g_blob_vkallocator->clear();
-        g_staging_vkallocator->clear();
-    }
-#endif // NCNN_VULKAN
-
-    // sleep 10 seconds for cooling down SOC  :(
+        // sleep 10 seconds for cooling down SOC  :(
 #ifdef _WIN32
-    Sleep(10 * 1000);
+        Sleep(10 * 1000);
+#elif defined(__unix__) || defined(__APPLE__)
+        sleep(10);
+#elif _POSIX_TIMERS
+        struct timespec ts;
+        ts.tv_sec = 10;
+        ts.tv_nsec = 0;
+        nanosleep(&ts, &ts);
 #else
-//     sleep(10);
+        // TODO How to handle it ?
 #endif
+    }
 
     ncnn::Mat out;
 
     // warm up
-    for (int i=0; i<g_warmup_loop_count; i++)
+    for (int i = 0; i < g_warmup_loop_count; i++)
     {
         ncnn::Extractor ex = net.create_extractor();
-        ex.input("data", in);
-        ex.extract("output", out);
+        ex.input(input_names[0], in);
+        ex.extract(output_names[0], out);
     }
 
     double time_min = DBL_MAX;
     double time_max = -DBL_MAX;
     double time_avg = 0;
 
-    for (int i=0; i<g_loop_count; i++)
+    for (int i = 0; i < g_loop_count; i++)
     {
         double start = ncnn::get_current_time();
 
         {
             ncnn::Extractor ex = net.create_extractor();
-            ex.input("data", in);
-            ex.extract("output", out);
+            ex.input(input_names[0], in);
+            ex.extract(output_names[0], out);
         }
 
         double end = ncnn::get_current_time();
@@ -187,9 +161,10 @@ void benchmark(const char* comment, const ncnn::Mat& in)
 int main(int argc, char** argv)
 {
     int loop_count = 4;
-    int num_threads = ncnn::get_cpu_count();
-    int powersave = 0;
+    int num_threads = ncnn::get_physical_big_cpu_count();
+    int powersave = 2;
     int gpu_device = -1;
+    int cooling_down = 1;
 
     if (argc >= 2)
     {
@@ -207,13 +182,25 @@ int main(int argc, char** argv)
     {
         gpu_device = atoi(argv[4]);
     }
+    if (argc >= 6)
+    {
+        cooling_down = atoi(argv[5]);
+    }
+
+#ifdef __EMSCRIPTEN__
+    EM_ASM(
+        FS.mkdir('/working');
+        FS.mount(NODEFS, {root: '.'}, '/working'););
+#endif // __EMSCRIPTEN__
 
     bool use_vulkan_compute = gpu_device != -1;
 
+    g_enable_cooling_down = cooling_down != 0;
+
     g_loop_count = loop_count;
 
-    g_blob_pool_allocator.set_size_compare_ratio(0.0f);
-    g_workspace_pool_allocator.set_size_compare_ratio(0.5f);
+    g_blob_pool_allocator.set_size_compare_ratio(0.f);
+    g_workspace_pool_allocator.set_size_compare_ratio(0.f);
 
 #if NCNN_VULKAN
     if (use_vulkan_compute)
@@ -222,30 +209,34 @@ int main(int argc, char** argv)
 
         g_vkdev = ncnn::get_gpu_device(gpu_device);
 
-        g_blob_vkallocator = new ncnn::VkBlobBufferAllocator(g_vkdev);
-        g_staging_vkallocator = new ncnn::VkStagingBufferAllocator(g_vkdev);
+        g_blob_vkallocator = new ncnn::VkBlobAllocator(g_vkdev);
+        g_staging_vkallocator = new ncnn::VkStagingAllocator(g_vkdev);
     }
 #endif // NCNN_VULKAN
 
     // default option
-    g_default_option.lightmode = true;
-    g_default_option.num_threads = num_threads;
-    g_default_option.blob_allocator = &g_blob_pool_allocator;
-    g_default_option.workspace_allocator = &g_workspace_pool_allocator;
+    ncnn::Option opt;
+    opt.lightmode = true;
+    opt.num_threads = num_threads;
+    opt.blob_allocator = &g_blob_pool_allocator;
+    opt.workspace_allocator = &g_workspace_pool_allocator;
 #if NCNN_VULKAN
-    g_default_option.blob_vkallocator = g_blob_vkallocator;
-    g_default_option.workspace_vkallocator = g_blob_vkallocator;
-    g_default_option.staging_vkallocator = g_staging_vkallocator;
+    opt.blob_vkallocator = g_blob_vkallocator;
+    opt.workspace_vkallocator = g_blob_vkallocator;
+    opt.staging_vkallocator = g_staging_vkallocator;
 #endif // NCNN_VULKAN
-    g_default_option.use_winograd_convolution = true;
-    g_default_option.use_sgemm_convolution = true;
-    g_default_option.use_int8_inference = true;
-    g_default_option.use_vulkan_compute = use_vulkan_compute;
-    g_default_option.use_fp16_packed = true;
-    g_default_option.use_fp16_storage = true;
-    g_default_option.use_fp16_arithmetic = true;
-    g_default_option.use_int8_storage = true;
-    g_default_option.use_int8_arithmetic = true;
+    opt.use_winograd_convolution = true;
+    opt.use_sgemm_convolution = true;
+    opt.use_int8_inference = true;
+    opt.use_vulkan_compute = use_vulkan_compute;
+    opt.use_fp16_packed = true;
+    opt.use_fp16_storage = true;
+    opt.use_fp16_arithmetic = true;
+    opt.use_int8_storage = true;
+    opt.use_int8_arithmetic = true;
+    opt.use_packing_layout = true;
+    opt.use_shader_pack8 = false;
+    opt.use_image_storage = false;
 
     ncnn::set_cpu_powersave(powersave);
 
@@ -256,85 +247,80 @@ int main(int argc, char** argv)
     fprintf(stderr, "num_threads = %d\n", num_threads);
     fprintf(stderr, "powersave = %d\n", ncnn::get_cpu_powersave());
     fprintf(stderr, "gpu_device = %d\n", gpu_device);
+    fprintf(stderr, "cooling_down = %d\n", (int)g_enable_cooling_down);
 
     // run
-    benchmark("squeezenet", ncnn::Mat(227, 227, 3));
+    benchmark("squeezenet", ncnn::Mat(227, 227, 3), opt);
 
-#if NCNN_VULKAN
-    if (!use_vulkan_compute)
-#endif // NCNN_VULKAN
-    benchmark("squeezenet_int8", ncnn::Mat(227, 227, 3));
+    benchmark("squeezenet_int8", ncnn::Mat(227, 227, 3), opt);
 
-    benchmark("mobilenet", ncnn::Mat(224, 224, 3));
+    benchmark("mobilenet", ncnn::Mat(224, 224, 3), opt);
 
-#if NCNN_VULKAN
-    if (!use_vulkan_compute)
-#endif // NCNN_VULKAN
-    benchmark("mobilenet_int8", ncnn::Mat(224, 224, 3));
+    benchmark("mobilenet_int8", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("mobilenet_v2", ncnn::Mat(224, 224, 3));
+    benchmark("mobilenet_v2", ncnn::Mat(224, 224, 3), opt);
 
-// #if NCNN_VULKAN
-//     if (!use_vulkan_compute)
-// #endif // NCNN_VULKAN
-//     benchmark("mobilenet_v2_int8", ncnn::Mat(224, 224, 3));
+    // benchmark("mobilenet_v2_int8", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("mobilenet_v3", ncnn::Mat(224, 224, 3));
+    benchmark("mobilenet_v3", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("shufflenet", ncnn::Mat(224, 224, 3));
+    benchmark("shufflenet", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("mnasnet", ncnn::Mat(224, 224, 3));
+    benchmark("shufflenet_v2", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("proxylessnasnet", ncnn::Mat(224, 224, 3));
+    benchmark("mnasnet", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("googlenet", ncnn::Mat(224, 224, 3));
+    benchmark("proxylessnasnet", ncnn::Mat(224, 224, 3), opt);
 
-#if NCNN_VULKAN
-    if (!use_vulkan_compute)
-#endif // NCNN_VULKAN
-    benchmark("googlenet_int8", ncnn::Mat(224, 224, 3));
+    benchmark("efficientnet_b0", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("resnet18", ncnn::Mat(224, 224, 3));
+    benchmark("efficientnetv2_b0", ncnn::Mat(224, 224, 3), opt);
 
-#if NCNN_VULKAN
-    if (!use_vulkan_compute)
-#endif // NCNN_VULKAN
-    benchmark("resnet18_int8", ncnn::Mat(224, 224, 3));
+    benchmark("regnety_400m", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("alexnet", ncnn::Mat(227, 227, 3));
+    benchmark("blazeface", ncnn::Mat(128, 128, 3), opt);
 
-    benchmark("vgg16", ncnn::Mat(224, 224, 3));
+    benchmark("googlenet", ncnn::Mat(224, 224, 3), opt);
 
-#if NCNN_VULKAN
-    if (!use_vulkan_compute)
-#endif // NCNN_VULKAN
-    benchmark("vgg16_int8", ncnn::Mat(224, 224, 3));
+    benchmark("googlenet_int8", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("resnet50", ncnn::Mat(224, 224, 3));
+    benchmark("resnet18", ncnn::Mat(224, 224, 3), opt);
 
-#if NCNN_VULKAN
-    if (!use_vulkan_compute)
-#endif // NCNN_VULKAN
-    benchmark("resnet50_int8", ncnn::Mat(224, 224, 3));
+    benchmark("resnet18_int8", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("squeezenet_ssd", ncnn::Mat(300, 300, 3));
+    benchmark("alexnet", ncnn::Mat(227, 227, 3), opt);
 
-#if NCNN_VULKAN
-    if (!use_vulkan_compute)
-#endif // NCNN_VULKAN
-    benchmark("squeezenet_ssd_int8", ncnn::Mat(300, 300, 3));
+    benchmark("vgg16", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("mobilenet_ssd", ncnn::Mat(300, 300, 3));
+    benchmark("vgg16_int8", ncnn::Mat(224, 224, 3), opt);
 
-#if NCNN_VULKAN
-    if (!use_vulkan_compute)
-#endif // NCNN_VULKAN
-    benchmark("mobilenet_ssd_int8", ncnn::Mat(300, 300, 3));
+    benchmark("resnet50", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("mobilenet_yolo", ncnn::Mat(416, 416, 3));
+    benchmark("resnet50_int8", ncnn::Mat(224, 224, 3), opt);
 
-    benchmark("mobilenetv2_yolov3", ncnn::Mat(352, 352, 3));
+    benchmark("squeezenet_ssd", ncnn::Mat(300, 300, 3), opt);
 
+    benchmark("squeezenet_ssd_int8", ncnn::Mat(300, 300, 3), opt);
+
+    benchmark("mobilenet_ssd", ncnn::Mat(300, 300, 3), opt);
+
+    benchmark("mobilenet_ssd_int8", ncnn::Mat(300, 300, 3), opt);
+
+    benchmark("mobilenet_yolo", ncnn::Mat(416, 416, 3), opt);
+
+    benchmark("mobilenetv2_yolov3", ncnn::Mat(352, 352, 3), opt);
+
+    benchmark("yolov4-tiny", ncnn::Mat(416, 416, 3), opt);
+
+    benchmark("nanodet_m", ncnn::Mat(320, 320, 3), opt);
+
+    benchmark("yolo-fastest-1.1", ncnn::Mat(320, 320, 3), opt);
+
+    benchmark("yolo-fastestv2", ncnn::Mat(352, 352, 3), opt);
+
+    benchmark("vision_transformer", ncnn::Mat(384, 384, 3), opt);
+
+    benchmark("FastestDet", ncnn::Mat(352, 352, 3), opt);
 #if NCNN_VULKAN
     delete g_blob_vkallocator;
     delete g_staging_vkallocator;

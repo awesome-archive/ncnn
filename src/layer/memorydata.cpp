@@ -16,8 +16,6 @@
 
 namespace ncnn {
 
-DEFINE_LAYER_CREATOR(MemoryData)
-
 MemoryData::MemoryData()
 {
     one_blob_only = false;
@@ -28,6 +26,7 @@ int MemoryData::load_param(const ParamDict& pd)
 {
     w = pd.get(0, 0);
     h = pd.get(1, 0);
+    d = pd.get(11, 0);
     c = pd.get(2, 0);
 
     return 0;
@@ -35,7 +34,11 @@ int MemoryData::load_param(const ParamDict& pd)
 
 int MemoryData::load_model(const ModelBin& mb)
 {
-    if (c != 0)
+    if (d != 0)
+    {
+        data = mb.load(w, h, d, c, 1);
+    }
+    else if (c != 0)
     {
         data = mb.load(w, h, c, 1);
     }

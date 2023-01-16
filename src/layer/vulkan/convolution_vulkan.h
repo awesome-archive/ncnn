@@ -29,46 +29,45 @@ public:
 
     virtual int upload_model(VkTransfer& cmd, const Option& opt);
 
+    using Convolution::forward;
     virtual int forward(const VkMat& bottom_blob, VkMat& top_blob, VkCompute& cmd, const Option& opt) const;
+    virtual int forward(const VkImageMat& bottom_blob, VkImageMat& top_blob, VkCompute& cmd, const Option& opt) const;
 
 public:
     ncnn::Layer* padding;
 
+    Mat weight_data_packed;
+    Mat weight_winograd23_data_packed;
+    Mat weight_winograd43_data_packed;
+    Mat bias_data_packed;
+
     VkMat weight_data_gpu;
     VkMat bias_data_gpu;
+
+    VkImageMat weight_data_gpu_image;
+    VkImageMat bias_data_gpu_image;
 
     Pipeline* pipeline_convolution;
     Pipeline* pipeline_convolution_1x1s1d1;
 
-    VkMat bias_data_gpu_pack4;
+    Pipeline* pipeline_convolution_gemm;
 
-    // pack4
-    VkMat weight_data_gpu_pack4;
-    Pipeline* pipeline_convolution_pack4;
-    Pipeline* pipeline_convolution_pack4_1x1s1d1;
-    Pipeline* pipeline_convolution_pack4_3x3s1d1_lds_8_8_2;
+    // winograd23 and winograd43
+    VkMat weight_data_gpu_tm_winograd23;
+    VkImageMat weight_data_gpu_tm_winograd23_image;
+    Pipeline* pipeline_convolution_3x3s1d1_winograd23_transform_input;
+    Pipeline* pipeline_convolution_3x3s1d1_winograd23_gemm;
+    Pipeline* pipeline_convolution_3x3s1d1_winograd23_transform_output;
 
-    // pack4 winograd23
-    ncnn::Layer* winograd_padding;
-    ncnn::Layer* winograd_crop;
-    VkMat weight_data_gpu_pack4_tm;
-    Pipeline* pipeline_convolution_pack4_3x3s1d1_winograd23_transform_input;
-    Pipeline* pipeline_convolution_pack4_3x3s1d1_winograd23_gemm;
-    Pipeline* pipeline_convolution_pack4_3x3s1d1_winograd23_transform_output;
-
-    // pack1to4
-    VkMat weight_data_gpu_pack1to4;
-    Pipeline* pipeline_convolution_pack1to4;
-
-    // pack4to1
-    VkMat weight_data_gpu_pack4to1;
-    Pipeline* pipeline_convolution_pack4to1;
+    VkMat weight_data_gpu_tm_winograd43;
+    VkImageMat weight_data_gpu_tm_winograd43_image;
+    Pipeline* pipeline_convolution_3x3s1d1_winograd43_transform_input;
+    Pipeline* pipeline_convolution_3x3s1d1_winograd43_gemm;
+    Pipeline* pipeline_convolution_3x3s1d1_winograd43_transform_output;
 
     // convolution as fc
-    Pipeline* pipeline_innerproduct;
-    Pipeline* pipeline_innerproduct_pack4;
-    Pipeline* pipeline_innerproduct_pack1to4;
-    Pipeline* pipeline_innerproduct_pack4to1;
+    ncnn::Layer* reshape_1x1xw;
+    ncnn::Layer* reshape_w;
 };
 
 } // namespace ncnn

@@ -20,18 +20,17 @@
 
 namespace ncnn {
 
-DEFINE_LAYER_CREATOR(Bias_arm)
-
 int Bias_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 {
     int w = bottom_top_blob.w;
     int h = bottom_top_blob.h;
+    int d = bottom_top_blob.d;
     int channels = bottom_top_blob.c;
-    int size = w * h;
+    int size = w * h * d;
 
     const float* bias_ptr = bias_data;
     #pragma omp parallel for num_threads(opt.num_threads)
-    for (int q=0; q<channels; q++)
+    for (int q = 0; q < channels; q++)
     {
         float* ptr = bottom_top_blob.channel(q);
 
@@ -46,7 +45,7 @@ int Bias_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
 
 #if __ARM_NEON
         float32x4_t _bias = vdupq_n_f32(bias);
-        for (; nn>0; nn--)
+        for (; nn > 0; nn--)
         {
             float32x4_t _p = vld1q_f32(ptr);
             float32x4_t _outp = vaddq_f32(_p, _bias);
@@ -56,7 +55,7 @@ int Bias_arm::forward_inplace(Mat& bottom_top_blob, const Option& opt) const
         }
 #endif // __ARM_NEON
 
-        for (; remain>0; remain--)
+        for (; remain > 0; remain--)
         {
             *ptr = *ptr + bias;
 
